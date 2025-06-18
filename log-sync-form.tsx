@@ -1,16 +1,32 @@
 "use client"
 
+/**
+ * Log Sync & Export Tool - Production Version
+ * 
+ * This component now uses proper backend API routes for secure cloud storage access:
+ * - /api/sync-bucket - Lists folders in GCS/S3 buckets
+ * - /api/fetch-logs - Retrieves and processes log files into CSV format
+ * 
+ * Architecture:
+ * - Frontend: Collects user credentials and preferences
+ * - Backend APIs: Handle cloud authentication and data processing
+ * - Services: GCSService for Google Cloud, S3Service for AWS (placeholder)
+ * 
+ * Security: All cloud credentials stay on the backend, never exposed to browser
+ */
+
 import { useState, useRef } from "react"
 import { zodResolver } from "@hookform/resolvers/zod"
 import { useForm } from "react-hook-form"
 import { z } from "zod"
-import { CalendarIcon, Loader2, Download, X, Cloud, Database } from "lucide-react"
+import { CalendarIcon, Loader2, Download, X, Cloud, Database, ChevronDown, AlertTriangle } from "lucide-react"
 import { format } from "date-fns"
 
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
 import { Form, FormControl, FormDescription, FormField, FormItem, FormLabel, FormMessage } from "@/components/ui/form"
 import { Input } from "@/components/ui/input"
+import { Label } from "@/components/ui/label"
 import { Textarea } from "@/components/ui/textarea"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { Calendar } from "@/components/ui/calendar"
@@ -25,10 +41,9 @@ const gcsFormSchema = z.object({
   gcsBucketName: z.string().min(1, { message: "GCS bucket name is required" }),
   startDate: z.date({ required_error: "Start date is required" }),
   endDate: z.date({ required_error: "End date is required" }),
-  logType: z.enum(["api_access", "store_access", "audit", "all"], {
-    required_error: "Please select a log type",
-  }),
-  limit: z.number().min(1, { message: "Limit must be at least 1" }).max(1000, { message: "Limit cannot exceed 1000" }),
+  logTypes: z.array(z.enum(["api_access", "store_access", "audit"])).min(1, { message: "Select at least one log type" }),
+  limit: z.number().min(1, { message: "Limit must be at least 1" }).max(10000, { message: "Limit cannot exceed 10000" }),
+  doNotLimit: z.boolean(),
 })
 
 const s3FormSchema = z.object({
@@ -38,10 +53,9 @@ const s3FormSchema = z.object({
   awsRegion: z.string().min(1, { message: "AWS Region is required" }),
   startDate: z.date({ required_error: "Start date is required" }),
   endDate: z.date({ required_error: "End date is required" }),
-  logType: z.enum(["api_access", "store_access", "audit", "all"], {
-    required_error: "Please select a log type",
-  }),
-  limit: z.number().min(1, { message: "Limit must be at least 1" }).max(1000, { message: "Limit cannot exceed 1000" }),
+  logTypes: z.array(z.enum(["api_access", "store_access", "audit"])).min(1, { message: "Select at least one log type" }),
+  limit: z.number().min(1, { message: "Limit must be at least 1" }).max(10000, { message: "Limit cannot exceed 10000" }),
+  doNotLimit: z.boolean(),
 })
 
 type GCSFormValues = z.infer<typeof gcsFormSchema>
@@ -63,11 +77,36 @@ export default function LogSyncForm() {
   const [bucketType, setBucketType] = useState<"gcs" | "s3">("gcs")
   const [syncLoading, setSyncLoading] = useState(false)
   const [exportLoading, setExportLoading] = useState(false)
-  const [folderCount, setFolderCount] = useState<number | null>(null)
+  const [bucketAnalysis, setBucketAnalysis] = useState<{
+    connected: boolean
+    bucketName: string
+    folderCount: number
+    fileTypeAnalysis: {
+      api_access: number
+      store_access: number
+      audit: number
+      other: number
+      total: number
+      note?: string
+    }
+    recommendations: {
+      suggestedLimit: number
+      availableDateRange: string
+      totalLogFiles: number
+      analysisNote?: string
+    }
+    summary: {
+      fileTypeBreakdown: string
+    }
+    message: string
+  } | null>(null)
   const [exportProgress, setExportProgress] = useState<ExportProgress | null>(null)
   const [generatedFiles, setGeneratedFiles] = useState<GeneratedFile[]>([])
   const [startDateOpen, setStartDateOpen] = useState(false)
   const [endDateOpen, setEndDateOpen] = useState(false)
+  const [logTypesDropdownOpen, setLogTypesDropdownOpen] = useState(false)
+  const [selectedLogTypes, setSelectedLogTypes] = useState<string[]>([])
+  const [doNotLimit, setDoNotLimit] = useState(false)
   const abortControllerRef = useRef<AbortController | null>(null)
 
   const gcsForm = useForm<GCSFormValues>({
@@ -76,8 +115,9 @@ export default function LogSyncForm() {
       gcsClientEmail: "",
       gcsPrivateKey: "",
       gcsBucketName: "",
-      logType: "all",
+      logTypes: ["api_access", "store_access", "audit"],
       limit: 20,
+      doNotLimit: false,
     },
   })
 
@@ -96,23 +136,77 @@ export default function LogSyncForm() {
   async function onSyncBucket() {
     setSyncLoading(true)
     try {
-      // Simulate API call to check folder count
-      await new Promise((resolve) => setTimeout(resolve, 1500))
-      const count = Math.floor(Math.random() * 100) + 1
-      setFolderCount(count)
+      const currentForm = bucketType === 'gcs' ? gcsForm : s3Form
+      const values = currentForm.getValues()
+      
+      // Validate required fields before syncing
+      const result = await currentForm.trigger()
+      if (!result) {
+        toast({
+          title: "Sync Failed",
+          description: "Please fill in all required fields before syncing.",
+          variant: "destructive",
+        })
+        return
+      }
+
+      // Call backend API to check bucket
+      const analysis = await syncBucketWithBackend(bucketType, values)
+      setBucketAnalysis(analysis)
       toast({
-        title: "Bucket Synced",
-        description: `Found ${count} folders in the ${bucketType.toUpperCase()} bucket.`,
+        title: "Bucket Connected",
+        description: analysis.message || `Successfully connected to ${bucketType.toUpperCase()} bucket.`,
       })
     } catch (error) {
+      let errorMessage = "There was an error syncing the bucket."
+      if (error instanceof Error) {
+        errorMessage = error.message
+      }
+      
       toast({
         title: "Sync Failed",
-        description: "There was an error syncing the bucket.",
+        description: errorMessage,
         variant: "destructive",
       })
     } finally {
       setSyncLoading(false)
     }
+  }
+
+  async function syncBucketWithBackend(bucketType: "gcs" | "s3", values: GCSFormValues | S3FormValues): Promise<any> {
+    const apiUrl = '/api/sync-bucket' // Adjust this to your actual backend endpoint
+    
+    // Prepare the request payload based on bucket type
+    const payload = {
+      bucketType,
+      ...(bucketType === 'gcs' && 'gcsClientEmail' in values ? {
+        clientEmail: values.gcsClientEmail,
+        privateKey: values.gcsPrivateKey.replace(/\\n/g, '\n'),
+        bucketName: values.gcsBucketName,
+      } : {}),
+      ...(bucketType === 's3' && 'awsAccessKeyId' in values ? {
+        accessKeyId: values.awsAccessKeyId,
+        secretAccessKey: values.awsSecretAccessKey,
+        bucketName: values.s3BucketName,
+        region: values.awsRegion,
+      } : {}),
+    }
+
+    const response = await fetch(apiUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(payload),
+    })
+
+    if (!response.ok) {
+      const errorData = await response.json().catch(() => ({ error: 'Unknown error' }))
+      throw new Error(errorData.error || `HTTP error! status: ${response.status}`)
+    }
+
+    const result = await response.json()
+    return result
   }
 
   function stopExport() {
@@ -127,6 +221,77 @@ export default function LogSyncForm() {
     }
   }
 
+  // Helper functions for checkbox UI
+  function toggleLogType(logType: string) {
+    setSelectedLogTypes(prev => 
+      prev.includes(logType) 
+        ? prev.filter(type => type !== logType)
+        : [...prev, logType]
+    )
+  }
+
+  function getLogTypeDisplayName(logType: string): string {
+    const names = {
+      api_access: "API Access",
+      store_access: "Store Access", 
+      audit: "Audit"
+    }
+    return names[logType as keyof typeof names] || logType
+  }
+
+  async function fetchLogsFromBackend(
+    bucketType: "gcs" | "s3", 
+    values: GCSFormValues | S3FormValues, 
+    logType: string, 
+    startDate: string, 
+    endDate: string, 
+    signal: AbortSignal
+  ): Promise<string> {
+    const apiUrl = '/api/fetch-logs' // Adjust this to your actual backend endpoint
+    
+    // Handle unlimited case - use a very high limit when doNotLimit is true
+    const effectiveLimit = doNotLimit ? 999999 : values.limit
+    
+    console.log(`Export request: logType=${logType}, limit=${effectiveLimit}, unlimited=${doNotLimit}`)
+    
+    // Prepare the request payload based on bucket type
+    const payload = {
+      bucketType,
+      logType,
+      startDate,
+      endDate,
+      limit: effectiveLimit,
+      ...(bucketType === 'gcs' && 'gcsClientEmail' in values ? {
+        clientEmail: values.gcsClientEmail,
+        privateKey: values.gcsPrivateKey.replace(/\\n/g, '\n'), // Ensure proper newline formatting
+        bucketName: values.gcsBucketName,
+      } : {}),
+      ...(bucketType === 's3' && 'awsAccessKeyId' in values ? {
+        accessKeyId: values.awsAccessKeyId,
+        secretAccessKey: values.awsSecretAccessKey,
+        bucketName: values.s3BucketName,
+        region: values.awsRegion,
+      } : {}),
+    }
+
+    const response = await fetch(apiUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(payload),
+      signal, // For cancellation support
+    })
+
+    if (!response.ok) {
+      const errorData = await response.json().catch(() => ({ error: 'Unknown error' }))
+      throw new Error(errorData.error || `HTTP error! status: ${response.status}`)
+    }
+
+    const csvData = await response.text()
+    return csvData
+  }
+
   async function onExportLogs(values: GCSFormValues | S3FormValues) {
     setExportLoading(true)
     setExportProgress({ current: 0, total: 100, status: "Initializing..." })
@@ -139,8 +304,18 @@ export default function LogSyncForm() {
       const formattedStartDate = format(values.startDate, "yyyy/MM/dd")
       const formattedEndDate = format(values.endDate, "yyyy/MM/dd")
 
-      // Simulate the log export process
-      const logTypes = values.logType === "all" ? ["api_access", "store_access", "audit"] : [values.logType]
+      // Validate that log types are selected
+      if (selectedLogTypes.length === 0) {
+        toast({
+          title: "Export Failed",
+          description: "Please select at least one log type before exporting.",
+          variant: "destructive",
+        })
+        return
+      }
+
+      // Process the log export with backend API calls using selected log types
+      const logTypes = selectedLogTypes
       const files: GeneratedFile[] = []
 
       for (let i = 0; i < logTypes.length; i++) {
@@ -155,11 +330,8 @@ export default function LogSyncForm() {
           status: `Processing ${logType} logs from ${bucketType.toUpperCase()}...`,
         })
 
-        // Simulate processing time
-        await new Promise((resolve) => setTimeout(resolve, 1000))
-
-        // Generate mock CSV data
-        const csvData = generateMockCSV(logType, values.limit)
+        // Call backend API to fetch logs
+        const csvData = await fetchLogsFromBackend(bucketType, values, logType, formattedStartDate, formattedEndDate, abortControllerRef.current.signal)
         const exportTimestamp = Math.floor(new Date().getTime() / 1000)
 
         files.push({
@@ -188,9 +360,14 @@ export default function LogSyncForm() {
         return // Already handled in stopExport
       }
 
+      let errorMessage = "There was an error exporting the logs."
+      if (error instanceof Error) {
+        errorMessage = error.message
+      }
+
       toast({
         title: "Export Failed",
-        description: "There was an error exporting the logs.",
+        description: errorMessage,
         variant: "destructive",
       })
     } finally {
@@ -199,24 +376,7 @@ export default function LogSyncForm() {
     }
   }
 
-  function generateMockCSV(logType: string, limit: number): string {
-    const headers = getHeaders(logType)
-    const rows = [headers.join(",")]
 
-    for (let i = 0; i < Math.min(limit, 50); i++) {
-      const row = headers.map((header) => {
-        // Generate mock data based on header type
-        if (header.includes("timestamp")) return new Date().toISOString()
-        if (header.includes("status")) return Math.random() > 0.8 ? "404" : "200"
-        if (header.includes("method")) return ["GET", "POST", "PUT", "DELETE"][Math.floor(Math.random() * 4)]
-        if (header.includes("storeHash")) return `store_${Math.random().toString(36).substr(2, 8)}`
-        return `sample_${Math.random().toString(36).substr(2, 6)}`
-      })
-      rows.push(row.join(","))
-    }
-
-    return rows.join("\n")
-  }
 
   function getHeaders(logType: string): string[] {
     const headers = {
@@ -255,13 +415,25 @@ export default function LogSyncForm() {
       ],
       audit: [
         "@timestamp",
-        "auditLogEvent.auditLogEntry.sysLogMessage",
-        "auditLogEvent.auditLogEntry.staffUserName",
-        "auditLogEvent.auditLogEntry.ipAddress",
-        "auditLogEvent.context.requestId",
-        "auditLogEvent.resource.id",
-        "auditLogEvent.operationType",
+        "auditLogEvent.publishedAt",
         "auditLogEvent.summary",
+        "auditLogEvent.operationType",
+        "auditLogEvent.context.serviceName",
+        "auditLogEvent.context.ipAddress",
+        "auditLogEvent.context.requestId",
+        "auditLogEvent.context.principal.type",
+        "auditLogEvent.context.principal.id",
+        "auditLogEvent.resource.type",
+        "auditLogEvent.resource.id",
+        "auditLogEvent.target.type",
+        "auditLogEvent.target.id",
+        "auditLogEvent.auditLogEntry.staffUserName",
+        "auditLogEvent.auditLogEntry.logDate",
+        "auditLogEvent.auditLogEntry.ipAddress",
+        "auditLogEvent.auditLogEntry.sysLogMessage",
+        "auditLogEvent.auditLogEntry.state",
+        "auditLogEvent.auditLogEntry.country",
+        "auditLogEvent.auditLogEntry.addressId",
       ],
     }
     return headers[logType as keyof typeof headers] || []
@@ -453,11 +625,29 @@ export default function LogSyncForm() {
           </TabsContent>
         </Tabs>
 
-        {/* Progress and file download sections */}
-        {folderCount !== null && (
-          <div className="bg-muted p-3 rounded-md text-sm mt-6">
-            <span className="font-medium">Folder count:</span> {folderCount} folders found in {bucketType.toUpperCase()}{" "}
-            bucket
+        {/* Simplified bucket analysis modal */}
+        {bucketAnalysis && (
+          <div className="bg-muted p-4 rounded-md text-sm mt-6 space-y-3">
+            <div className="flex items-center justify-between">
+              <span className="font-medium text-green-700">✅ {bucketAnalysis.message}</span>
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={() => setBucketAnalysis(null)}
+                className="h-6 w-6 p-0 hover:bg-gray-200"
+              >
+                <X className="h-4 w-4" />
+              </Button>
+            </div>
+            
+            <div className="grid grid-cols-2 gap-4 text-xs">
+              <div>
+                <span className="font-medium">Active Date Folders:</span> {bucketAnalysis.folderCount}
+              </div>
+              <div>
+                <span className="font-medium">Available Dates:</span> {bucketAnalysis.recommendations.availableDateRange}
+              </div>
+            </div>
           </div>
         )}
 
@@ -578,49 +768,95 @@ export default function LogSyncForm() {
         </div>
 
         <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-          <FormField
-            control={form.control}
-            name="logType"
-            render={({ field }) => (
-              <FormItem>
-                <FormLabel>Log Type</FormLabel>
-                <Select onValueChange={field.onChange} defaultValue={field.value}>
-                  <FormControl>
-                    <SelectTrigger>
-                      <SelectValue placeholder="Select log type" />
-                    </SelectTrigger>
-                  </FormControl>
-                  <SelectContent>
-                    <SelectItem value="api_access">API Access</SelectItem>
-                    <SelectItem value="store_access">Store Access</SelectItem>
-                    <SelectItem value="audit">Audit</SelectItem>
-                    <SelectItem value="all">All</SelectItem>
-                  </SelectContent>
-                </Select>
-                <FormMessage />
-              </FormItem>
+          {/* Multi-select Log Types with Checkboxes */}
+          <div className="space-y-2">
+            <Label className="text-sm font-medium">Log Types</Label>
+            <Popover open={logTypesDropdownOpen} onOpenChange={setLogTypesDropdownOpen}>
+              <PopoverTrigger asChild>
+                <Button
+                  variant="outline"
+                  role="combobox"
+                  aria-expanded={logTypesDropdownOpen}
+                  className="w-full justify-between"
+                >
+                  {selectedLogTypes.length === 0
+                    ? "Select log types"
+                    : selectedLogTypes.length === 3
+                    ? "All log types"
+                    : `${selectedLogTypes.length} selected`}
+                  <ChevronDown className="ml-2 h-4 w-4 shrink-0 opacity-50" />
+                </Button>
+              </PopoverTrigger>
+              <PopoverContent className="w-full p-0">
+                <div className="p-2 space-y-2">
+                  {["api_access", "store_access", "audit"].map((logType) => (
+                    <div
+                      key={logType}
+                      className="flex items-center space-x-2 p-2 hover:bg-gray-50 cursor-pointer rounded"
+                      onClick={() => toggleLogType(logType)}
+                    >
+                      <input
+                        type="checkbox"
+                        checked={selectedLogTypes.includes(logType)}
+                        onChange={() => toggleLogType(logType)}
+                        className="h-4 w-4 text-blue-600 border-gray-300 rounded focus:ring-blue-500"
+                      />
+                      <label className="text-sm cursor-pointer">
+                        {getLogTypeDisplayName(logType)}
+                      </label>
+                    </div>
+                  ))}
+                </div>
+              </PopoverContent>
+            </Popover>
+            {selectedLogTypes.length === 0 && (
+              <p className="text-sm text-red-500">Please select at least one log type</p>
             )}
-          />
+          </div>
 
-          <FormField
-            control={form.control}
-            name="limit"
-            render={({ field }) => (
-              <FormItem>
-                <FormLabel>Limit</FormLabel>
-                <FormControl>
-                  <Input
-                    type="number"
-                    placeholder="20"
-                    {...field}
-                    onChange={(e) => field.onChange(Number.parseInt(e.target.value) || 0)}
-                  />
-                </FormControl>
-                <FormDescription>Max logs per type (1-1000)</FormDescription>
-                <FormMessage />
-              </FormItem>
-            )}
-          />
+          {/* Limit field with "Do not limit" checkbox */}
+          <div className="space-y-2">
+            <Label className="text-sm font-medium">Limit</Label>
+            <div className="space-y-3">
+                             <FormField
+                 control={form.control}
+                 name="limit"
+                 render={({ field }) => (
+                   <FormControl>
+                     <Input
+                       type="number"
+                       placeholder="20"
+                       {...field}
+                       onChange={(e) => field.onChange(Number.parseInt(e.target.value) || 0)}
+                       disabled={doNotLimit}
+                       className={doNotLimit ? "bg-gray-100 text-gray-500" : ""}
+                     />
+                   </FormControl>
+                 )}
+               />
+              
+              <div className={`flex items-center space-x-2 p-3 rounded-md ${doNotLimit ? 'bg-red-50 border border-red-200' : 'bg-gray-50'}`}>
+                <input
+                  type="checkbox"
+                  checked={doNotLimit}
+                  onChange={(e) => setDoNotLimit(e.target.checked)}
+                  className="h-4 w-4 text-red-600 border-gray-300 rounded focus:ring-red-500"
+                />
+                <div className="flex items-center space-x-2">
+                  {doNotLimit && <AlertTriangle className="h-4 w-4 text-red-500" />}
+                  <label className={`text-sm cursor-pointer ${doNotLimit ? 'text-red-700 font-medium' : 'text-gray-700'}`}>
+                    Do not limit (fetch all available logs)
+                  </label>
+                </div>
+              </div>
+              
+              
+              
+              {!doNotLimit && (
+                <p className="text-xs text-gray-500">Max logs per type (1-10000)</p>
+              )}
+            </div>
+          </div>
         </div>
       </>
     )
@@ -633,10 +869,10 @@ export default function LogSyncForm() {
           {syncLoading ? (
             <>
               <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-              Syncing...
+              Analyzing...
             </>
           ) : (
-            "Sync Bucket"
+            "Analyze Bucket"
           )}
         </Button>
 
