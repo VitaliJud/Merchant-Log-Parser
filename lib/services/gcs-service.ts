@@ -42,77 +42,89 @@ export class GCSService {
       analysisNote?: string
     }
   }> {
-    console.log(`[GCS] 🔍 Starting optimized bucket analysis for: ${this.config.bucketName}`)
+    console.log(`[GCS] 🔍 Starting bucket analysis for: ${this.config.bucketName}`)
     
     const accessToken = await this.getAccessToken()
     console.log(`[GCS] ✅ Authentication successful`)
     
-    // Generate recent date folders to check
+    // Skip bucket validation step - we'll validate access by trying to list objects directly
+    // This avoids requiring bucket-level metadata permissions
+    console.log(`[GCS] 🪣 Validating bucket access by listing objects...`)
+    
+    // Generate just the most recent date folder to check (reduced from 15 to 1)
     const recentDateFolders = this.generateRecentDateFolders()
-    console.log(`[GCS] 📅 Will check ${recentDateFolders.length} recent date folders for folder existence`)
+    const mostRecentFolder = recentDateFolders[0] // Just check the most recent folder
+    console.log(`[GCS] 📅 Checking most recent date folder: ${mostRecentFolder}`)
 
     const activeDates: string[] = []
 
-    // Efficiently check which date folders have files (minimal API calls)
-    for (const folder of recentDateFolders) {
-      console.log(`[GCS] 🔍 Checking if folder has files: ${folder}`)
-      
-      // Just check if folder has any files (maxResults=1 for efficiency)
-      const filesResponse = await fetch(
-        `https://storage.googleapis.com/storage/v1/b/${this.config.bucketName}/o?prefix=${encodeURIComponent(folder)}&maxResults=1`,
-        {
-          headers: {
-            'Authorization': `Bearer ${accessToken}`,
-            'Content-Type': 'application/json',
-          },
-        }
-      )
+    // Check if the most recent folder has files
+    console.log(`[GCS] 🔍 Checking if folder has files: ${mostRecentFolder}`)
+    
+    const filesResponse = await fetch(
+      `https://storage.googleapis.com/storage/v1/b/${this.config.bucketName}/o?prefix=${encodeURIComponent(mostRecentFolder)}&maxResults=1`,
+      {
+        headers: {
+          'Authorization': `Bearer ${accessToken}`,
+          'Content-Type': 'application/json',
+        },
+      }
+    )
 
-      if (filesResponse.ok) {
-        const filesData = await filesResponse.json()
-        const files = filesData.items || []
-        
-        // Only add to dates if we found at least one file
-        if (files.length > 0) {
-          const dateStr = folder.replace(/\//g, '-').slice(0, -1) // Convert "2024/01/01/" to "2024-01-01"
-          activeDates.push(dateStr)
-          console.log(`[GCS] ✅ Found files in ${folder}`)
-        }
+    if (filesResponse.ok) {
+      const filesData = await filesResponse.json()
+      const files = filesData.items || []
+      
+      // Only add to dates if we found at least one file
+      if (files.length > 0) {
+        const dateStr = mostRecentFolder.replace(/\//g, '-').slice(0, -1) // Convert "2024/01/01/" to "2024-01-01"
+        activeDates.push(dateStr)
+        console.log(`[GCS] ✅ Found files in ${mostRecentFolder}`)
       } else {
-        console.log(`[GCS] ⚠️  No access to folder ${folder} or folder doesn't exist`)
+        console.log(`[GCS] ⚠️  No files found in most recent folder: ${mostRecentFolder}`)
+      }
+      
+      console.log(`[GCS] ✅ Bucket access validated successfully`)
+    } else {
+      // Handle bucket access errors with specific error messages
+      const errorText = await filesResponse.text().catch(() => 'Unknown error')
+      console.error(`[GCS] ❌ Bucket access validation failed: ${filesResponse.status} - ${errorText}`)
+      
+      if (filesResponse.status === 404) {
+        throw new Error(`Bucket "${this.config.bucketName}" not found. Please check the bucket name.`)
+      } else if (filesResponse.status === 403) {
+        throw new Error(`Access denied to bucket "${this.config.bucketName}". Check your service account permissions.`)
+      } else {
+        throw new Error(`Bucket access failed: ${filesResponse.status} ${filesResponse.statusText}`)
       }
     }
 
-    console.log(`[GCS] 📊 Analysis summary: Found ${activeDates.length} active date folders`)
+    console.log(`[GCS] 📊 Analysis summary: ${activeDates.length > 0 ? 'Found' : 'No'} files in most recent date folder`)
 
-    // Calculate date range
-    const earliestDate = activeDates.sort()[0]
-    const latestDate = activeDates.sort().reverse()[0]
-    const availableDateRange = earliestDate && latestDate ? 
-      (earliestDate === latestDate ? latestDate : `${earliestDate} to ${latestDate}`) : 
-      'No recent dates found'
+    // Simple date range (just the one folder we checked)
+    const availableDateRange = activeDates.length > 0 ? activeDates[0] : 'No recent files found'
 
-    console.log(`[GCS] 📊 Analysis complete: ${activeDates.length} active folders found`)
+    console.log(`[GCS] 📊 Analysis complete: Bucket access confirmed, ${activeDates.length > 0 ? 'files found' : 'no files found'}`)
 
-    // Return minimal data since UI doesn't need file type analysis anymore
+    // Return minimal data for fast analysis
     return {
       connected: true,
-      folderCount: activeDates.length, // Number of date folders with actual files  
+      folderCount: activeDates.length, // 0 or 1
       fileTypeAnalysis: {
         api_access: 0,
         store_access: 0,
         audit: 0,
         other: 0,
         total: 0,
-        note: 'File type analysis skipped for performance - optimized for folder count only'
+        note: 'Quick analysis - only checked most recent date folder for performance'
       },
-      recentDates: activeDates.slice(0, 10),
+      recentDates: activeDates,
       sampleFiles: [],
       recommendations: {
-        suggestedLimit: 20, // Simple default
+        suggestedLimit: 20,
         availableDateRange,
         totalLogFiles: 0,
-        analysisNote: `Found ${activeDates.length} active date folders. File sampling skipped for performance.`
+        analysisNote: `Bucket access confirmed successfully. ${activeDates.length > 0 ? 'Files found in most recent date folder.' : 'No files found in most recent date folder - try different date range.'}`
       }
     }
   }
@@ -299,27 +311,49 @@ export class GCSService {
   }
 
   private async createJWT(): Promise<string> {
-    const now = Math.floor(Date.now() / 1000)
-    const payload = {
-      iss: this.config.clientEmail,
-      scope: 'https://www.googleapis.com/auth/cloud-platform',
-      aud: 'https://oauth2.googleapis.com/token',
-      exp: now + 3600,
-      iat: now,
+    try {
+      // Validate private key format before processing
+      if (!this.config.privateKey.includes('-----BEGIN PRIVATE KEY-----')) {
+        throw new Error('Private key must include -----BEGIN PRIVATE KEY----- header. Please check your private key format.')
+      }
+
+      if (!this.config.privateKey.includes('-----END PRIVATE KEY-----')) {
+        throw new Error('Private key must include -----END PRIVATE KEY----- footer. Please check your private key format.')
+      }
+
+      const now = Math.floor(Date.now() / 1000)
+      const payload = {
+        iss: this.config.clientEmail,
+        scope: 'https://www.googleapis.com/auth/cloud-platform',
+        aud: 'https://oauth2.googleapis.com/token',
+        exp: now + 3600,
+        iat: now,
+      }
+
+      const cleanedKey = this.config.privateKey
+        .replace(/\\n/g, '\n')
+        .replace(/^"/, '')
+        .replace(/"$/, '')
+
+      const privateKey = await importPKCS8(cleanedKey, 'RS256')
+      
+      const jwt = await new SignJWT(payload)
+        .setProtectedHeader({ alg: 'RS256' })
+        .sign(privateKey)
+
+      return jwt
+    } catch (error) {
+      if (error instanceof Error) {
+        if (error.message.includes('Private key must include')) {
+          throw error // Re-throw our specific validation errors
+        } else if (error.message.includes('Invalid key') || error.message.includes('key import')) {
+          throw new Error('Invalid private key format. Please ensure you have copied the complete private key including headers and footers.')
+        } else {
+          throw new Error(`Private key error: ${error.message}`)
+        }
+      }
+      throw error
     }
-
-    const cleanedKey = this.config.privateKey
-      .replace(/\\n/g, '\n')
-      .replace(/^"/, '')
-      .replace(/"$/, '')
-
-    const privateKey = await importPKCS8(cleanedKey, 'RS256')
-    
-    const jwt = await new SignJWT(payload)
-      .setProtectedHeader({ alg: 'RS256' })
-      .sign(privateKey)
-
-    return jwt
   }
 
   private async exchangeJWTForAccessToken(jwt: string): Promise<string> {
@@ -340,7 +374,30 @@ export class GCSService {
     if (!response.ok) {
       const errorText = await response.text()
       console.error('[GCS] OAuth2 error:', errorText)
-      throw new Error(`Failed to get access token: ${response.status} - ${errorText}`)
+      
+      try {
+        const errorData = JSON.parse(errorText)
+        
+        // Handle specific OAuth errors with user-friendly messages
+        if (errorData.error === 'invalid_grant') {
+          if (errorData.error_description?.includes('Invalid JWT')) {
+            throw new Error('Invalid credentials: JWT authentication failed. Check your private key and client email.')
+          } else if (errorData.error_description?.includes('email')) {
+            throw new Error('Invalid client email: Service account email is incorrect or not found.')  
+          } else {
+            throw new Error('Invalid credentials: Authentication failed. Please verify your service account credentials.')
+          }
+        } else if (errorData.error === 'invalid_client') {
+          throw new Error('Invalid client email: Service account not found or disabled.')
+        } else if (errorData.error === 'unauthorized_client') {
+          throw new Error('Access denied: Service account is not authorized. Check your service account permissions.')
+        } else {
+          throw new Error(`Authentication failed: ${errorData.error} - ${errorData.error_description || 'Unknown error'}`)
+        }
+      } catch (parseError) {
+        // If we can't parse the JSON error response, fall back to generic message
+        throw new Error(`Authentication failed: ${response.status} - ${errorText}`)
+      }
     }
 
     const data = await response.json()
@@ -380,20 +437,19 @@ export class GCSService {
   }
 
   private generateRecentDateFolders(): string[] {
-    // Generate the last 15 days of date folders for analysis (matching 14-day retention + 1 buffer)
+    // Generate just the most recent date folder for quick analysis 
     const folders: string[] = []
     const today = new Date()
     
-    for (let i = 0; i < 15; i++) {
-      const date = new Date(today)
-      date.setDate(today.getDate() - i)
-      
-      const year = date.getFullYear()
-      const month = String(date.getMonth() + 1).padStart(2, '0')
-      const day = String(date.getDate()).padStart(2, '0')
-      
-      folders.push(`${year}/${month}/${day}/`)
-    }
+    // Just get yesterday's folder (most likely to have complete logs)
+    const date = new Date(today)
+    date.setDate(today.getDate() - 1)
+    
+    const year = date.getFullYear()
+    const month = String(date.getMonth() + 1).padStart(2, '0')
+    const day = String(date.getDate()).padStart(2, '0')
+    
+    folders.push(`${year}/${month}/${day}/`)
     
     return folders
   }

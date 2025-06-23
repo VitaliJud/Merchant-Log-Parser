@@ -15,11 +15,11 @@
  * Security: All cloud credentials stay on the backend, never exposed to browser
  */
 
-import { useState, useRef } from "react"
+import { useState, useRef, useEffect } from "react"
 import { zodResolver } from "@hookform/resolvers/zod"
 import { useForm } from "react-hook-form"
 import { z } from "zod"
-import { CalendarIcon, Loader2, Download, X, Cloud, Database, ChevronDown, AlertTriangle } from "lucide-react"
+import { CalendarIcon, Loader2, Download, X, Cloud, Database, ChevronDown, AlertTriangle, BookOpen } from "lucide-react"
 import { format } from "date-fns"
 
 import { Button } from "@/components/ui/button"
@@ -34,6 +34,7 @@ import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover
 import { toast } from "@/hooks/use-toast"
 import { Progress } from "@/components/ui/progress"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
+import { ErrorModal } from "@/components/ui/error-modal"
 
 const gcsFormSchema = z.object({
   gcsClientEmail: z.string().email({ message: "Please enter a valid email address" }),
@@ -108,6 +109,38 @@ export default function LogSyncForm() {
   const [selectedLogTypes, setSelectedLogTypes] = useState<string[]>([])
   const [doNotLimit, setDoNotLimit] = useState(false)
   const abortControllerRef = useRef<AbortController | null>(null)
+  
+  // Error modal state
+  const [errorModal, setErrorModal] = useState<{
+    isOpen: boolean
+    title: string
+    message: string
+    type: 'error' | 'warning'
+  }>({
+    isOpen: false,
+    title: '',
+    message: '',
+    type: 'error'
+  })
+
+  // Handle anchor navigation
+  useEffect(() => {
+    const hash = window.location.hash.substring(1) // Remove the #
+    if (hash === 'gcs' || hash === 's3') {
+      setBucketType(hash)
+    }
+  }, [])
+
+  const handleTabChange = (value: string) => {
+    setBucketType(value as "gcs" | "s3")
+    // Update the URL hash
+    window.history.replaceState(null, '', `#${value}`)
+  }
+
+  const openDocumentation = () => {
+    const docUrl = `/how-to#${bucketType}`
+    window.open(docUrl, '_blank')
+  }
 
   const gcsForm = useForm<GCSFormValues>({
     resolver: zodResolver(gcsFormSchema),
@@ -128,10 +161,47 @@ export default function LogSyncForm() {
       awsSecretAccessKey: "",
       s3BucketName: "",
       awsRegion: "",
-      logType: "all",
+      logTypes: ["api_access", "store_access", "audit"],
       limit: 20,
+      doNotLimit: false,
     },
   })
+
+  // Client-side validation functions
+  function validatePrivateKey(privateKey: string): { isValid: boolean; error?: string } {
+    if (!privateKey || privateKey.trim() === '') {
+      return { isValid: false, error: 'Private key is required.' }
+    }
+
+    if (!privateKey.includes('-----BEGIN PRIVATE KEY-----')) {
+      return { 
+        isValid: false, 
+        error: 'Invalid private key format. The private key must start with "-----BEGIN PRIVATE KEY-----".\n\nPlease ensure you have copied the complete private key including the header and footer.' 
+      }
+    }
+
+    if (!privateKey.includes('-----END PRIVATE KEY-----')) {
+      return { 
+        isValid: false, 
+        error: 'Invalid private key format. The private key must end with "-----END PRIVATE KEY-----".\n\nPlease ensure you have copied the complete private key including the header and footer.' 
+      }
+    }
+
+    return { isValid: true }
+  }
+
+  function showErrorModal(title: string, message: string, type: 'error' | 'warning' = 'error') {
+    setErrorModal({
+      isOpen: true,
+      title,
+      message,
+      type
+    })
+  }
+
+  function closeErrorModal() {
+    setErrorModal(prev => ({ ...prev, isOpen: false }))
+  }
 
   async function onSyncBucket() {
     setSyncLoading(true)
@@ -142,12 +212,23 @@ export default function LogSyncForm() {
       // Validate required fields before syncing
       const result = await currentForm.trigger()
       if (!result) {
-        toast({
-          title: "Sync Failed",
-          description: "Please fill in all required fields before syncing.",
-          variant: "destructive",
-        })
+        showErrorModal(
+          "Validation Failed",
+          "Please fill in all required fields before analyzing the bucket."
+        )
         return
+      }
+
+      // Client-side validation for GCS private key
+      if (bucketType === 'gcs' && 'gcsPrivateKey' in values) {
+        const privateKeyValidation = validatePrivateKey(values.gcsPrivateKey)
+        if (!privateKeyValidation.isValid) {
+          showErrorModal(
+            "Private Key Format Error",
+            privateKeyValidation.error || "Invalid private key format."
+          )
+          return
+        }
       }
 
       // Call backend API to check bucket
@@ -158,16 +239,35 @@ export default function LogSyncForm() {
         description: analysis.message || `Successfully connected to ${bucketType.toUpperCase()} bucket.`,
       })
     } catch (error) {
-      let errorMessage = "There was an error syncing the bucket."
+      let errorTitle = "Connection Failed"
+      let errorMessage = "There was an error connecting to the bucket."
+      
       if (error instanceof Error) {
-        errorMessage = error.message
+        const errorText = error.message.toLowerCase()
+        
+        // Handle specific authentication errors
+        if (errorText.includes('private key') || errorText.includes('begin private key')) {
+          errorTitle = "Private Key Error"
+          errorMessage = "Invalid private key format. Make sure it includes '-----BEGIN PRIVATE KEY-----' and '-----END PRIVATE KEY-----' markers.\n\nPlease copy the complete private key from your service account JSON file."
+        } else if (errorText.includes('client email') || errorText.includes('email')) {
+          errorTitle = "Client Email Error" 
+          errorMessage = "Invalid client email. Please check your service account email address.\n\nThe email should look like: service-account@project-id.iam.gserviceaccount.com"
+        } else if (errorText.includes('bucket') && errorText.includes('not found')) {
+          errorTitle = "Bucket Not Found"
+          errorMessage = "The specified bucket does not exist or you don't have access to it.\n\nPlease verify:\n• The bucket name is correct\n• The bucket exists in your project\n• Your service account has access to the bucket"
+        } else if (errorText.includes('access denied') || errorText.includes('unauthorized')) {
+          errorTitle = "Access Denied"
+          errorMessage = "Your credentials don't have permission to access this bucket.\n\nPlease ensure your service account has the following permissions:\n• Storage Object Viewer\n• Storage Legacy Bucket Reader"
+        } else if (errorText.includes('invalid credentials') || errorText.includes('authentication')) {
+          errorTitle = "Invalid Credentials"
+          errorMessage = "Authentication failed. Please verify your credentials are correct.\n\nCommon issues:\n• Incorrect client email\n• Malformed private key\n• Service account is disabled"
+        } else {
+          errorMessage = error.message
+        }
       }
       
-      toast({
-        title: "Sync Failed",
-        description: errorMessage,
-        variant: "destructive",
-      })
+      // Show error modal instead of toast for better visibility
+      showErrorModal(errorTitle, errorMessage)
     } finally {
       setSyncLoading(false)
     }
@@ -301,16 +401,27 @@ export default function LogSyncForm() {
     abortControllerRef.current = new AbortController()
 
     try {
+      // Client-side validation for GCS private key before export
+      if (bucketType === 'gcs' && 'gcsPrivateKey' in values) {
+        const privateKeyValidation = validatePrivateKey(values.gcsPrivateKey)
+        if (!privateKeyValidation.isValid) {
+          showErrorModal(
+            "Private Key Format Error",
+            privateKeyValidation.error || "Invalid private key format."
+          )
+          return
+        }
+      }
+
       const formattedStartDate = format(values.startDate, "yyyy/MM/dd")
       const formattedEndDate = format(values.endDate, "yyyy/MM/dd")
 
       // Validate that log types are selected
       if (selectedLogTypes.length === 0) {
-        toast({
-          title: "Export Failed",
-          description: "Please select at least one log type before exporting.",
-          variant: "destructive",
-        })
+        showErrorModal(
+          "Export Configuration Error",
+          "Please select at least one log type before exporting logs."
+        )
         return
       }
 
@@ -360,23 +471,37 @@ export default function LogSyncForm() {
         return // Already handled in stopExport
       }
 
+      let errorTitle = "Export Failed"
       let errorMessage = "There was an error exporting the logs."
+      
       if (error instanceof Error) {
-        errorMessage = error.message
+        const errorText = error.message.toLowerCase()
+        
+        // Handle specific export errors
+        if (errorText.includes('private key') || errorText.includes('begin private key')) {
+          errorTitle = "Authentication Error During Export"
+          errorMessage = "Invalid private key format detected during export.\n\nPlease ensure your private key includes the complete header and footer:\n• -----BEGIN PRIVATE KEY-----\n• -----END PRIVATE KEY-----"
+        } else if (errorText.includes('access denied') || errorText.includes('unauthorized')) {
+          errorTitle = "Access Denied During Export"
+          errorMessage = "Your credentials don't have permission to access the log files.\n\nPlease ensure your service account has:\n• Storage Object Viewer permissions\n• Access to the specific bucket and date folders"
+        } else if (errorText.includes('bucket') && errorText.includes('not found')) {
+          errorTitle = "Bucket Access Error"
+          errorMessage = "The bucket could not be accessed during export.\n\nPlease verify:\n• The bucket name is correct\n• Your service account has proper permissions\n• The bucket exists in your project"
+        } else if (errorText.includes('no data') || errorText.includes('no files')) {
+          errorTitle = "No Log Data Found"
+          errorMessage = "No log files were found for the specified date range and log types.\n\nPlease try:\n• Adjusting the date range\n• Checking if logs exist for those dates\n• Verifying the bucket contains log files"
+        } else {
+          errorMessage = error.message
+        }
       }
 
-      toast({
-        title: "Export Failed",
-        description: errorMessage,
-        variant: "destructive",
-      })
+      // Show error modal for export errors for better visibility
+      showErrorModal(errorTitle, errorMessage)
     } finally {
       setExportLoading(false)
       setTimeout(() => setExportProgress(null), 3000)
     }
   }
-
-
 
   function getHeaders(logType: string): string[] {
     const headers = {
@@ -465,13 +590,35 @@ export default function LogSyncForm() {
   }
 
   return (
-    <Card className="w-full max-w-4xl mx-auto">
-      <CardHeader>
-        <CardTitle>Log Sync & Export Tool</CardTitle>
-        <CardDescription>Configure bucket settings to sync and export logs.</CardDescription>
-      </CardHeader>
-      <CardContent>
-        <Tabs value={bucketType} onValueChange={(value) => setBucketType(value as "gcs" | "s3")} className="w-full">
+    <>
+      <ErrorModal
+        isOpen={errorModal.isOpen}
+        onClose={closeErrorModal}
+        title={errorModal.title}
+        message={errorModal.message}
+        type={errorModal.type}
+      />
+      
+      <Card className="w-full max-w-4xl mx-auto">
+        <CardHeader>
+          <div className="flex items-center justify-between">
+            <div>
+              <CardTitle>Log Sync & Export Tool</CardTitle>
+              <CardDescription>Configure bucket settings to sync and export logs.</CardDescription>
+            </div>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={openDocumentation}
+              className="flex items-center gap-2 h-9 w-9 p-0"
+              title={`Open ${bucketType.toUpperCase()} setup documentation`}
+            >
+              <BookOpen className="w-4 h-4" />
+            </Button>
+          </div>
+        </CardHeader>
+        <CardContent>
+        <Tabs value={bucketType} onValueChange={handleTabChange} className="w-full">
           <TabsList className="grid w-full grid-cols-2 mb-6">
             <TabsTrigger
               value="gcs"
@@ -640,14 +787,14 @@ export default function LogSyncForm() {
               </Button>
             </div>
             
-            <div className="grid grid-cols-2 gap-4 text-xs">
+            {/* <div className="grid grid-cols-2 gap-4 text-xs">
               <div>
                 <span className="font-medium">Active Date Folders:</span> {bucketAnalysis.folderCount}
               </div>
               <div>
                 <span className="font-medium">Available Dates:</span> {bucketAnalysis.recommendations.availableDateRange}
               </div>
-            </div>
+            </div> */}
           </div>
         )}
 
@@ -682,6 +829,7 @@ export default function LogSyncForm() {
         )}
       </CardContent>
     </Card>
+    </>
   )
 
   function renderCommonFields(
@@ -872,7 +1020,7 @@ export default function LogSyncForm() {
               Analyzing...
             </>
           ) : (
-            "Analyze Bucket"
+            "Connect to Bucket"
           )}
         </Button>
 

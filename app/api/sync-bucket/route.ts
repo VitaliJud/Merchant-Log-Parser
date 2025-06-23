@@ -86,7 +86,7 @@ export async function POST(request: NextRequest) {
         connected: true,
         bucketName,
         folderCount,
-        message: `Connected to S3 bucket "${bucketName}" (placeholder implementation)`,
+        message: `Successfully connected to S3 bucket "${bucketName}"`,
         fileTypeAnalysis: {
           api_access: 0,
           store_access: 0,

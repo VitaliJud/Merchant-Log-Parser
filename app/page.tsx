@@ -1,9 +1,13 @@
 import LogSyncForm from "../log-sync-form"
+import { Navigation } from "../components/navigation"
 
 export default function Page() {
   return (
-    <main className="flex min-h-screen flex-col items-center justify-center p-24">
-      <LogSyncForm />
-    </main>
+    <div className="min-h-screen bg-gray-50">
+      <Navigation />
+      <main className="flex flex-col items-center justify-center p-8 pt-16">
+        <LogSyncForm />
+      </main>
+    </div>
   )
 }
