@@ -1,4 +1,5 @@
 import { SignJWT, importPKCS8 } from 'jose'
+import { logger } from '@/lib/utils'
 
 export interface GCSConfig {
   clientEmail: string
@@ -14,11 +15,11 @@ export class GCSService {
   }
 
   async getAccessToken(): Promise<string> {
-    console.log('[GCS] Creating JWT...')
+    logger.debug('GCS', 'Creating JWT...')
     const jwt = await this.createJWT()
-    console.log('[GCS] JWT created, exchanging for access token...')
+    logger.debug('GCS', 'JWT created, exchanging for access token...')
     const accessToken = await this.exchangeJWTForAccessToken(jwt)
-    console.log('[GCS] Access token obtained')
+    logger.debug('GCS', 'Access token obtained')
     return accessToken
   }
 
@@ -42,24 +43,25 @@ export class GCSService {
       analysisNote?: string
     }
   }> {
-    console.log(`[GCS] 🔍 Starting bucket analysis for: ${this.config.bucketName}`)
+    logger.info('GCS', `Starting bucket analysis for: ${this.config.bucketName}`)
+    logger.time('GCS', 'bucket-analysis')
     
     const accessToken = await this.getAccessToken()
-    console.log(`[GCS] ✅ Authentication successful`)
+    logger.debug('GCS', 'Authentication successful')
     
     // Skip bucket validation step - we'll validate access by trying to list objects directly
     // This avoids requiring bucket-level metadata permissions
-    console.log(`[GCS] 🪣 Validating bucket access by listing objects...`)
+    logger.debug('GCS', 'Validating bucket access by listing objects...')
     
     // Generate just the most recent date folder to check (reduced from 15 to 1)
     const recentDateFolders = this.generateRecentDateFolders()
     const mostRecentFolder = recentDateFolders[0] // Just check the most recent folder
-    console.log(`[GCS] 📅 Checking most recent date folder: ${mostRecentFolder}`)
+    logger.debug('GCS', `Checking most recent date folder: ${mostRecentFolder}`)
 
     const activeDates: string[] = []
 
     // Check if the most recent folder has files
-    console.log(`[GCS] 🔍 Checking if folder has files: ${mostRecentFolder}`)
+    logger.debug('GCS', `Checking if folder has files: ${mostRecentFolder}`)
     
     const filesResponse = await fetch(
       `https://storage.googleapis.com/storage/v1/b/${this.config.bucketName}/o?prefix=${encodeURIComponent(mostRecentFolder)}&maxResults=1`,
@@ -79,16 +81,16 @@ export class GCSService {
       if (files.length > 0) {
         const dateStr = mostRecentFolder.replace(/\//g, '-').slice(0, -1) // Convert "2024/01/01/" to "2024-01-01"
         activeDates.push(dateStr)
-        console.log(`[GCS] ✅ Found files in ${mostRecentFolder}`)
+        logger.debug('GCS', `Found files in ${mostRecentFolder}`)
       } else {
-        console.log(`[GCS] ⚠️  No files found in most recent folder: ${mostRecentFolder}`)
+        logger.warn('GCS', `No files found in most recent folder: ${mostRecentFolder}`)
       }
       
-      console.log(`[GCS] ✅ Bucket access validated successfully`)
+      logger.info('GCS', 'Bucket access validated successfully')
     } else {
       // Handle bucket access errors with specific error messages
       const errorText = await filesResponse.text().catch(() => 'Unknown error')
-      console.error(`[GCS] ❌ Bucket access validation failed: ${filesResponse.status} - ${errorText}`)
+      logger.error('GCS', `Bucket access validation failed: ${filesResponse.status}`, errorText)
       
       if (filesResponse.status === 404) {
         throw new Error(`Bucket "${this.config.bucketName}" not found. Please check the bucket name.`)
@@ -99,12 +101,13 @@ export class GCSService {
       }
     }
 
-    console.log(`[GCS] 📊 Analysis summary: ${activeDates.length > 0 ? 'Found' : 'No'} files in most recent date folder`)
+    logger.debug('GCS', `Analysis summary: ${activeDates.length > 0 ? 'Found' : 'No'} files in most recent date folder`)
 
     // Simple date range (just the one folder we checked)
     const availableDateRange = activeDates.length > 0 ? activeDates[0] : 'No recent files found'
 
-    console.log(`[GCS] 📊 Analysis complete: Bucket access confirmed, ${activeDates.length > 0 ? 'files found' : 'no files found'}`)
+    logger.timeEnd('GCS', 'bucket-analysis')
+    logger.info('GCS', `Analysis complete: Bucket access confirmed, ${activeDates.length > 0 ? 'files found' : 'no files found'}`)
 
     // Return minimal data for fast analysis
     return {
@@ -138,16 +141,17 @@ export class GCSService {
   async fetchLogs(logType: string, startDate: string, endDate: string, limit: number): Promise<string> {
     // Check if this is an unlimited request (very high limit means "do not limit")
     const isUnlimited = limit >= 999999
-    console.log(`\n[GCS] 📥 Starting log fetch for type: ${logType}, dates: ${startDate} to ${endDate}, limit: ${limit}${isUnlimited ? ' (UNLIMITED)' : ''}`)
+    logger.info('GCS', `Starting log fetch: ${logType}, ${startDate} to ${endDate}, limit: ${limit}${isUnlimited ? ' (UNLIMITED)' : ''}`)
+    logger.time('GCS', 'fetch-logs')
     
     try {
-      console.log('[GCS] 🔐 Getting access token...')
+      logger.debug('GCS', 'Getting access token...')
       const accessToken = await this.getAccessToken()
-      console.log('[GCS] ✅ Access token obtained successfully')
+      logger.debug('GCS', 'Access token obtained successfully')
       
       // Build date folders to search (YYYY/MM/DD format)
       const dateFolders = this.buildDateFolders(startDate, endDate)
-      console.log(`[GCS] 📁 Will search ${dateFolders.length} date folder(s)`)
+      logger.debug('GCS', `Will search ${dateFolders.length} date folder(s)`)
       
       const headers = this.getHeaders(logType === 'all' ? 'api_access' : logType) // Use first type for headers
       const csvRows = [headers.join(',')]
@@ -156,10 +160,10 @@ export class GCSService {
       
       // Process each date folder
       for (const folderPath of dateFolders) {
-        console.log(`[GCS] 📂 Fetching files from folder: "${folderPath}"`)
+        logger.debug('GCS', `Fetching files from folder: "${folderPath}"`)
         
         const listUrl = `https://storage.googleapis.com/storage/v1/b/${this.config.bucketName}/o?prefix=${encodeURIComponent(folderPath)}&maxResults=1000`
-        console.log(`[GCS] 🔍 Listing objects from: ${listUrl}`)
+        logger.debug('GCS', `Listing objects from: ${listUrl}`)
         
         const response = await fetch(listUrl, {
           headers: {
@@ -168,20 +172,20 @@ export class GCSService {
           },
         })
 
-        console.log(`[GCS] 📡 List response status: ${response.status}`)
+        logger.debug('GCS', `List response status: ${response.status}`)
 
         if (!response.ok) {
           const errorText = await response.text()
-          console.error(`[GCS] List error for folder ${folderPath}:`, errorText)
+          logger.error('GCS', `List error for folder ${folderPath}:`, errorText)
           continue // Skip this folder and try the next one
         }
 
         const data = await response.json()
         const allFiles = data.items || []
-        console.log(`[GCS] 📋 Found ${allFiles.length} total files in ${folderPath}`)
+        logger.debug('GCS', `Found ${allFiles.length} total files in ${folderPath}`)
         
         if (allFiles.length === 0) {
-          console.warn(`[GCS] ⚠️  No files found in folder: "${folderPath}"`)
+          logger.warn('GCS', `No files found in folder: "${folderPath}"`)
           continue
         }
         
@@ -190,12 +194,12 @@ export class GCSService {
           this.shouldProcessFile(file.name, logType)
         )
         
-        console.log(`[GCS] 🎯 Filtered to ${relevantFiles.length} relevant files for log type: ${logType}`)
+        logger.debug('GCS', `Filtered to ${relevantFiles.length} relevant files for log type: ${logType}`)
         
         if (relevantFiles.length > 0) {
-          console.log('[GCS] 📄 Relevant files found:')
+          logger.debug('GCS', 'Relevant files found:')
           relevantFiles.slice(0, 5).forEach((file: any, index: number) => {
-            console.log(`  ${index + 1}. ${file.name} (${file.size} bytes)`)
+            logger.debug('GCS', `  ${index + 1}. ${file.name} (${file.size} bytes)`)
           })
         }
         
@@ -203,7 +207,7 @@ export class GCSService {
         if (!isUnlimited) {
           const remainingLimit = limit - totalLogEntries
           if (remainingLimit <= 0) {
-            console.log(`[GCS] 🔢 Reached limit of ${limit} entries, stopping`)
+            logger.debug('GCS', `Reached limit of ${limit} entries, stopping`)
             break
           }
         }
@@ -215,7 +219,7 @@ export class GCSService {
         for (const file of filesToProcess) {
           if (!isUnlimited && totalLogEntries >= limit) break
           
-          console.log(`[GCS] 🔄 Processing file: ${file.name}`)
+          logger.debug('GCS', `Processing file: ${file.name}`)
           
           try {
             const downloadUrl = `https://storage.googleapis.com/storage/v1/b/${file.bucket}/o/${encodeURIComponent(file.name)}?alt=media`
@@ -233,45 +237,45 @@ export class GCSService {
                const contentType = fileResponse.headers.get('content-type') || ''
                const isActuallyCompressed = contentType.includes('gzip') || contentType.includes('application/gzip')
                
-               console.log(`[GCS] 📋 Content-Type: ${contentType}`)
+               logger.debug('GCS', `Content-Type: ${contentType}`)
                
                // Check if file appears to be compressed based on name and content-type
                if (file.name.endsWith('.gz')) {
                  if (contentType.includes('text/plain') || contentType.includes('application/json')) {
-                   console.log(`[GCS] 💡 File has .gz extension but content-type is ${contentType}, reading as plain text`)
+                   logger.debug('GCS', `File has .gz extension but content-type is ${contentType}, reading as plain text`)
                    logContent = await fileResponse.text()
-                   console.log(`[GCS] 📥 Read as plain text: ${logContent.length} characters`)
+                   logger.debug('GCS', `Read as plain text: ${logContent.length} characters`)
                  } else {
-                   console.log(`[GCS] 🗜️  Attempting to decompress .gz file: ${file.name}`)
+                   logger.debug('GCS', `Attempting to decompress .gz file: ${file.name}`)
                    try {
                      const compressedData = await fileResponse.arrayBuffer()
                      logContent = await this.decompressGzipContent(compressedData)
-                     console.log(`[GCS] ✅ Successfully decompressed to ${logContent.length} characters`)
+                     logger.debug('GCS', `Successfully decompressed to ${logContent.length} characters`)
                    } catch (gzipError) {
-                     console.log(`[GCS] ⚠️  Gzip decompression failed, trying as plain text: ${gzipError}`)
+                     logger.warn('GCS', `Gzip decompression failed, trying as plain text:`, gzipError)
                      // Reset response and try as plain text
                      const textResponse = await fetch(downloadUrl, {
                        headers: { 'Authorization': `Bearer ${accessToken}` }
                      })
                      logContent = await textResponse.text()
-                     console.log(`[GCS] 📥 Fallback: Read as plain text: ${logContent.length} characters`)
+                     logger.debug('GCS', `Fallback: Read as plain text: ${logContent.length} characters`)
                    }
                  }
                } else {
                  logContent = await fileResponse.text()
-                 console.log(`[GCS] 📥 Downloaded ${logContent.length} characters from ${file.name}`)
+                 logger.debug('GCS', `Downloaded ${logContent.length} characters from ${file.name}`)
                }
                
                // Show a sample of the content for debugging
                const contentSample = logContent.substring(0, 200).replace(/\n/g, '\\n')
-               console.log(`[GCS] 👀 Content sample: ${contentSample}...`)
+               logger.debug('GCS', `Content sample: ${contentSample}...`)
                
                // Detect the actual log type for this file
                const fileLogType = this.getLogTypeFromFileName(file.name) || logType
-               console.log(`[GCS] 🏷️  Processing as log type: ${fileLogType}`)
+               logger.debug('GCS', `Processing as log type: ${fileLogType}`)
                
                              const logLines = this.parseLogContent(logContent, fileLogType)
-              console.log(`[GCS] 📝 Parsed ${logLines.length} log lines from ${file.name}`)
+              logger.debug('GCS', `Parsed ${logLines.length} log lines from ${file.name}`)
              
              const linesToAdd = isUnlimited 
                ? logLines 
@@ -280,32 +284,33 @@ export class GCSService {
              totalLogEntries += linesToAdd.length
              totalProcessedFiles++
              
-             console.log(`[GCS] ✅ Added ${linesToAdd.length} lines to CSV. Total entries: ${totalLogEntries}`)
+             logger.debug('GCS', `Added ${linesToAdd.length} lines to CSV. Total entries: ${totalLogEntries}`)
              
              if (!isUnlimited && totalLogEntries >= limit) {
-               console.log(`[GCS] 🔢 Reached limit of ${limit} entries`)
+               logger.debug('GCS', `Reached limit of ${limit} entries`)
                break
              }
             } else {
               const errorText = await fileResponse.text()
-              console.error(`[GCS] ❌ Failed to download ${file.name}: ${fileResponse.status} - ${errorText}`)
+              logger.error('GCS', `Failed to download ${file.name}: ${fileResponse.status}`, errorText)
             }
           } catch (error) {
-            console.error(`[GCS] ❌ Error processing file ${file.name}:`, error)
+            logger.error('GCS', `Error processing file ${file.name}:`, error)
           }
         }
       }
       
-      console.log(`[GCS] 🏁 Finished processing${isUnlimited ? ' (UNLIMITED MODE)' : ''}. Files: ${totalProcessedFiles}, Log entries: ${totalLogEntries}`)
+      logger.timeEnd('GCS', 'fetch-logs')
+      logger.info('GCS', `Finished processing${isUnlimited ? ' (UNLIMITED MODE)' : ''}. Files: ${totalProcessedFiles}, Log entries: ${totalLogEntries}`)
       
       if (totalLogEntries === 0) {
-        console.warn('[GCS] ⚠️  Warning: No data rows generated (only headers)')
-        console.log('[GCS] 💡 Check your date folder and file naming pattern')
+        logger.warn('GCS', 'Warning: No data rows generated (only headers)')
+        logger.warn('GCS', 'Check your date folder and file naming pattern')
       }
       
       return csvRows.join('\n')
     } catch (error) {
-      console.error('[GCS] ❌ Error in fetchLogs:', error)
+      logger.error('GCS', 'Error in fetchLogs:', error)
       throw error
     }
   }
@@ -514,8 +519,6 @@ export class GCSService {
       throw new Error(`Failed to decompress gzip file: ${error}`)
     }
   }
-
-
 
   private parseLogContent(content: string, logType: string): string[] {
     console.log(`[GCS] 🔍 Parsing JSONL content for log type: ${logType}`)
